@@ -6,21 +6,20 @@ import { config } from '../config/env.js';
 let client = null;
 let qrCode = null;
 let isReady = false;
-
-// Timestamp de cuando el cliente se conectó (unix segundos)
-// Se usa para ignorar mensajes muy antiguos que llegan en la sincronización inicial
 let readyTimestamp = 0;
 
-// Margen de gracia: aceptamos mensajes de hasta 2 minutos ANTES del ready.
-// Esto cubre el caso donde WhatsApp asigna al mensaje un timestamp del servidor
-// que puede ser unos segundos previo al evento 'ready' local.
-const OLD_MESSAGE_THRESHOLD_SEC = 120;
+// Callback guardado para usar también desde el poller
+let _onClientMessage = null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Registro de IDs de mensajes enviados por el bot
-// ─────────────────────────────────────────────────────────────────────────────
+// Procesados por el poller — evita procesar 2 veces el mismo msg
+const processedIds = new Set();
+const PROCESSED_TTL = 5 * 60_000; // 5 min
+
+// IDs de mensajes enviados por el bot
 const botSentIds = new Set();
 const BOT_ID_TTL = 60_000;
+
+const OLD_MESSAGE_THRESHOLD_SEC = 120;
 
 function registerBotMessage(msgId) {
   if (!msgId) return;
@@ -32,9 +31,17 @@ function isBotMessage(msgId) {
   return msgId && botSentIds.has(msgId);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Filtro de JIDs válidos (solo chats 1-a-1 con clientes reales)
-// ─────────────────────────────────────────────────────────────────────────────
+function markProcessed(msgId) {
+  if (!msgId) return;
+  processedIds.add(msgId);
+  setTimeout(() => processedIds.delete(msgId), PROCESSED_TTL);
+}
+
+function wasProcessed(msgId) {
+  return msgId && processedIds.has(msgId);
+}
+
+// ─── Filtro de JIDs válidos ────────────────────────────────────────────────
 function isValidClientJid(jid) {
   if (!jid) return false;
   if (jid.includes('@g.us')) return false;
@@ -49,9 +56,68 @@ export function isClientReady() { return isReady; }
 export function getClient() { return client; }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Procesar un mensaje entrante (unificado: usado por evento Y por poller)
+// ─────────────────────────────────────────────────────────────────────────────
+async function processIncomingMessage(msg, source = 'event') {
+  try {
+    if (msg.fromMe) return;
+    if (!isValidClientJid(msg.from)) return;
+
+    const msgId = msg.id?._serialized || msg.id?.id;
+    if (wasProcessed(msgId)) return;
+    markProcessed(msgId);
+
+    // Ignorar muy antiguos
+    if (msg.timestamp && msg.timestamp < (readyTimestamp - OLD_MESSAGE_THRESHOLD_SEC)) {
+      return;
+    }
+
+    const text = (msg.body || '').trim();
+    if (!text) return;
+
+    const userId = msg.from;
+    const pushName = msg._data?.notifyName || msg.notifyName || '';
+
+    logger.info(`[WA:${source}] ← ${userId} (${pushName}): ${text.substring(0, 60)}`);
+    if (_onClientMessage) {
+      await _onClientMessage({ userId, text, pushName });
+    }
+  } catch (err) {
+    logger.error(`[WA] Error procesando mensaje: ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POLLER de fallback — revisa chats con mensajes no leídos cada 5 segundos
+// Crítico para mitigar el bug de whatsapp-web.js #5765 donde los eventos
+// 'message' no se disparan confiablemente.
+// ─────────────────────────────────────────────────────────────────────────────
+async function runPoller() {
+  if (!isReady || !client) return;
+
+  try {
+    const chats = await client.getChats();
+    for (const chat of chats) {
+      if (!chat.unreadCount || chat.unreadCount < 1) continue;
+      if (!isValidClientJid(chat.id?._serialized)) continue;
+
+      // Trae los últimos N mensajes del chat (N = unreadCount)
+      const messages = await chat.fetchMessages({ limit: chat.unreadCount });
+      for (const msg of messages) {
+        await processIncomingMessage(msg, 'poll');
+      }
+    }
+  } catch (err) {
+    logger.error(`[WA:Poller] Error: ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────────────────────────────────────
 export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
+  _onClientMessage = onClientMessage;
+
   const puppeteerConfig = {
     headless: true,
     args: [
@@ -86,6 +152,10 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
     qrCode = null;
     readyTimestamp = Math.floor(Date.now() / 1000);
     logger.info(`[WA] ✅ WhatsApp conectado y listo (readyTs=${readyTimestamp})`);
+
+    // Arrancar poller cada 5s como fallback
+    setInterval(runPoller, 5_000);
+    logger.info('[WA] Poller de fallback iniciado (intervalo: 5s)');
   });
 
   client.on('authenticated', () => logger.info('[WA] Autenticado'));
@@ -99,45 +169,12 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
     }, 5000);
   });
 
-  // ── Mensajes ENTRANTES del cliente ──────────────────────────────────────────
+  // ── Mensajes ENTRANTES (evento en tiempo real) ──────────────────────────────
   client.on('message', async (msg) => {
-    try {
-      if (msg.fromMe) return;
-
-      // Log RAW para diagnóstico — cada mensaje que entra, sin filtros
-      logger.info(`[WA:RAW-IN] from=${msg.from} ts=${msg.timestamp} body="${(msg.body || '').substring(0, 40)}"`);
-
-      // Filtrar JIDs no válidos (estados, broadcasts, canales, grupos)
-      if (!isValidClientJid(msg.from)) {
-        logger.info(`[WA] Ignorado (JID inválido): ${msg.from}`);
-        return;
-      }
-
-      // Ignorar mensajes muy antiguos (sincronización inicial)
-      // Con margen de gracia de 2 minutos para cubrir desfase de timestamp
-      if (msg.timestamp && msg.timestamp < (readyTimestamp - OLD_MESSAGE_THRESHOLD_SEC)) {
-        logger.info(`[WA] Ignorado (mensaje antiguo): ${msg.from} ts=${msg.timestamp} readyTs=${readyTimestamp}`);
-        return;
-      }
-
-      const text = msg.body?.trim();
-      if (!text) {
-        logger.info(`[WA] Ignorado (sin texto): ${msg.from}`);
-        return;
-      }
-
-      const userId = msg.from;
-      const pushName = msg._data?.notifyName || '';
-
-      logger.info(`[WA] ← ${userId} (${pushName}): ${text.substring(0, 60)}`);
-      await onClientMessage({ userId, text, pushName });
-
-    } catch (err) {
-      logger.error(`[WA] Error en message: ${err.message}`);
-    }
+    await processIncomingMessage(msg, 'evt');
   });
 
-  // ── Mensajes SALIENTES ──────────────────────────────────────────────────────
+  // ── Mensajes SALIENTES ─────────────────────────────────────────────────────
   client.on('message_create', async (msg) => {
     try {
       if (!msg.fromMe) return;
@@ -145,13 +182,11 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
 
       const msgId = msg.id?._serialized;
       if (!msgId) return;
-
       if (isBotMessage(msgId)) return;
 
       const clientUserId = msg.to;
-      logger.info(`[WA] → Gerardo escribió a ${clientUserId}: ${msg.body?.substring(0, 60)}`);
+      logger.info(`[WA] → Gerardo escribió a ${clientUserId}: ${(msg.body || '').substring(0, 60)}`);
       await onAdvisorMessage({ clientUserId });
-
     } catch (err) {
       logger.error(`[WA] Error en message_create: ${err.message}`);
     }
