@@ -8,16 +8,19 @@ let qrCode = null;
 let isReady = false;
 
 // Timestamp de cuando el cliente se conectó (unix segundos)
-// Se usa para ignorar mensajes antiguos que llegan en la sincronización inicial
+// Se usa para ignorar mensajes muy antiguos que llegan en la sincronización inicial
 let readyTimestamp = 0;
+
+// Margen de gracia: aceptamos mensajes de hasta 2 minutos ANTES del ready.
+// Esto cubre el caso donde WhatsApp asigna al mensaje un timestamp del servidor
+// que puede ser unos segundos previo al evento 'ready' local.
+const OLD_MESSAGE_THRESHOLD_SEC = 120;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registro de IDs de mensajes enviados por el bot
-// Se registra ANTES del envío para garantizar que message_create nunca
-// confunda un mensaje del bot con uno del asesor, incluso si el envío falla
 // ─────────────────────────────────────────────────────────────────────────────
 const botSentIds = new Set();
-const BOT_ID_TTL = 60_000; // 60 segundos — amplio para latencia + reintentos
+const BOT_ID_TTL = 60_000;
 
 function registerBotMessage(msgId) {
   if (!msgId) return;
@@ -30,20 +33,14 @@ function isBotMessage(msgId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Filtro de JIDs NO válidos (estados, broadcasts, canales, grupos)
-// Solo aceptamos chats 1-a-1 con clientes reales: formato `NUMERO@c.us`
+// Filtro de JIDs válidos (solo chats 1-a-1 con clientes reales)
 // ─────────────────────────────────────────────────────────────────────────────
 function isValidClientJid(jid) {
   if (!jid) return false;
-  // Grupos
   if (jid.includes('@g.us')) return false;
-  // Estados de WhatsApp (historias)
   if (jid === 'status@broadcast' || jid.includes('@broadcast')) return false;
-  // Canales (newsletters)
   if (jid.includes('@newsletter')) return false;
-  // Listas de difusión
   if (jid.includes('@lid')) return false;
-  // Solo aceptar chats normales
   return jid.endsWith('@c.us');
 }
 
@@ -88,7 +85,7 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
     isReady = true;
     qrCode = null;
     readyTimestamp = Math.floor(Date.now() / 1000);
-    logger.info('[WA] ✅ WhatsApp conectado y listo');
+    logger.info(`[WA] ✅ WhatsApp conectado y listo (readyTs=${readyTimestamp})`);
   });
 
   client.on('authenticated', () => logger.info('[WA] Autenticado'));
@@ -107,19 +104,27 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
     try {
       if (msg.fromMe) return;
 
-      // Filtrar estados, broadcasts, canales, grupos
-      if (!isValidClientJid(msg.from)) return;
+      // Log RAW para diagnóstico — cada mensaje que entra, sin filtros
+      logger.info(`[WA:RAW-IN] from=${msg.from} ts=${msg.timestamp} body="${(msg.body || '').substring(0, 40)}"`);
 
-      // Ignorar mensajes antiguos (los que llegan en la sincronización inicial
-      // cuando el cliente se reconecta). Solo procesamos mensajes posteriores
-      // al timestamp de `ready`.
-      if (msg.timestamp && msg.timestamp < readyTimestamp) {
-        logger.debug(`[WA] Mensaje antiguo ignorado de ${msg.from} (ts=${msg.timestamp})`);
+      // Filtrar JIDs no válidos (estados, broadcasts, canales, grupos)
+      if (!isValidClientJid(msg.from)) {
+        logger.info(`[WA] Ignorado (JID inválido): ${msg.from}`);
+        return;
+      }
+
+      // Ignorar mensajes muy antiguos (sincronización inicial)
+      // Con margen de gracia de 2 minutos para cubrir desfase de timestamp
+      if (msg.timestamp && msg.timestamp < (readyTimestamp - OLD_MESSAGE_THRESHOLD_SEC)) {
+        logger.info(`[WA] Ignorado (mensaje antiguo): ${msg.from} ts=${msg.timestamp} readyTs=${readyTimestamp}`);
         return;
       }
 
       const text = msg.body?.trim();
-      if (!text) return;
+      if (!text) {
+        logger.info(`[WA] Ignorado (sin texto): ${msg.from}`);
+        return;
+      }
 
       const userId = msg.from;
       const pushName = msg._data?.notifyName || '';
@@ -132,23 +137,17 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
     }
   });
 
-  // ── Mensajes SALIENTES — distinguir bot vs asesor por ID exacto ─────────────
+  // ── Mensajes SALIENTES ──────────────────────────────────────────────────────
   client.on('message_create', async (msg) => {
     try {
       if (!msg.fromMe) return;
-
-      // Filtrar estados, broadcasts, canales, grupos
       if (!isValidClientJid(msg.to)) return;
 
       const msgId = msg.id?._serialized;
       if (!msgId) return;
 
-      // Si el ID fue registrado por el bot antes de enviar → ignorar
-      if (isBotMessage(msgId)) {
-        return;
-      }
+      if (isBotMessage(msgId)) return;
 
-      // ID no registrado → fue Gerardo escribiendo manualmente
       const clientUserId = msg.to;
       logger.info(`[WA] → Gerardo escribió a ${clientUserId}: ${msg.body?.substring(0, 60)}`);
       await onAdvisorMessage({ clientUserId });
@@ -162,7 +161,7 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WhatsAppService — API pública para el flujo
+// WhatsAppService
 // ─────────────────────────────────────────────────────────────────────────────
 export const WhatsAppService = {
 
@@ -172,7 +171,6 @@ export const WhatsAppService = {
       return;
     }
 
-    // Seguridad extra: no enviar a destinos inválidos
     if (!isValidClientJid(to)) {
       logger.warn(`[WA] Destino inválido, no se envía: ${to}`);
       return;
@@ -184,7 +182,7 @@ export const WhatsAppService = {
 
       if (msgId) {
         registerBotMessage(msgId);
-        logger.debug(`[WA] Enviado a ${to} (ID: ${msgId.slice(-8)})`);
+        logger.info(`[WA] → Enviado a ${to} (ID: ${msgId.slice(-8)})`);
       } else {
         logger.warn(`[WA] Mensaje enviado a ${to} sin ID retornado`);
       }
