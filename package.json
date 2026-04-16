@@ -1,14 +1,16 @@
 {
   "name": "kia-bot-gerardo",
   "version": "3.0.0",
-  "description": "KIA Bot Bryan — Vyntra Orbit",
+  "description": "KIA Bot Gerardo — Vyntra Orbit",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon --ignore wwebjs_auth/ --ignore .wwebjs_cache/ --ignore logs/ src/index.js"
   },
-  "engines": { "node": ">=18.0.0" },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

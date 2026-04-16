@@ -1,8 +1,16 @@
 [phases.setup]
-nixPkgs = ["nodejs_22", "chromium", "nss", "freetype", "harfbuzz"]
+nixPkgs = [
+  "nodejs_22",
+  "nss",
+  "freetype",
+  "harfbuzz",
+  "ca-certificates",
+  "fontconfig",
+  "liberation_ttf"
+]
 
 [phases.install]
-cmds = ["npm ci"]
+cmds = ["npm ci --omit=dev"]
 
 [start]
 cmd = "node src/index.js"

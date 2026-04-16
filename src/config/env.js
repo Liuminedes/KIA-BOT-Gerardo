@@ -20,6 +20,8 @@ export const config = {
   admin: {
     token: process.env.ADMIN_TOKEN,
   },
-  // Disco persistente en Render, fallback a /tmp en Railway
-  authPath: process.env.AUTH_DATA_PATH || '/data/wwebjs_auth',
+  // Path del volumen persistente (configurado en la plataforma de deploy).
+  // En Railway: montar un Volume en esta ruta exacta.
+  // En local: usa ./wwebjs_auth (no persistente, solo para desarrollo).
+  authPath: process.env.AUTH_DATA_PATH || './wwebjs_auth',
 };
