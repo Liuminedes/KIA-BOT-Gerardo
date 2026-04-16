@@ -1,12 +1,5 @@
 [phases.setup]
-nixPkgs = [
-  "nodejs_22",
-  "fontconfig",
-  "freetype",
-  "harfbuzz",
-  "nss",
-  "cacert"
-]
+nixPkgs = ["nodejs_22"]
 
 [phases.install]
 cmds = ["npm ci --omit=dev"]
