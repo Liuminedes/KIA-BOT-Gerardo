@@ -43,10 +43,8 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
       '--disable-accelerated-2d-canvas',
       '--no-first-run',
       '--no-zygote',
+      '--single-process',
       '--disable-gpu',
-      '--disable-extensions',
-      '--disable-software-rasterizer',
-      '--disable-background-networking',
     ],
   };
 
