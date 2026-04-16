@@ -1,25 +1,19 @@
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
+import fs from 'fs';
+import path from 'path';
 import { logger } from '../config/logger.js';
 import { config } from '../config/env.js';
 
 let client = null;
 let qrCode = null;
 let isReady = false;
-let readyTimestamp = 0;
 
-// Callback guardado para usar también desde el poller
-let _onClientMessage = null;
-
-// Procesados por el poller — evita procesar 2 veces el mismo msg
-const processedIds = new Set();
-const PROCESSED_TTL = 5 * 60_000; // 5 min
-
-// IDs de mensajes enviados por el bot
+// ─────────────────────────────────────────────────────────────────────────────
+// Registro de IDs de mensajes enviados por el bot (distinguir bot vs asesor)
+// ─────────────────────────────────────────────────────────────────────────────
 const botSentIds = new Set();
 const BOT_ID_TTL = 60_000;
-
-const OLD_MESSAGE_THRESHOLD_SEC = 120;
 
 function registerBotMessage(msgId) {
   if (!msgId) return;
@@ -31,17 +25,9 @@ function isBotMessage(msgId) {
   return msgId && botSentIds.has(msgId);
 }
 
-function markProcessed(msgId) {
-  if (!msgId) return;
-  processedIds.add(msgId);
-  setTimeout(() => processedIds.delete(msgId), PROCESSED_TTL);
-}
-
-function wasProcessed(msgId) {
-  return msgId && processedIds.has(msgId);
-}
-
-// ─── Filtro de JIDs válidos ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Filtro de JIDs válidos (solo chats 1-a-1, sin estados/grupos/broadcasts)
+// ─────────────────────────────────────────────────────────────────────────────
 function isValidClientJid(jid) {
   if (!jid) return false;
   if (jid.includes('@g.us')) return false;
@@ -51,73 +37,28 @@ function isValidClientJid(jid) {
   return jid.endsWith('@c.us');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Limpiar directorio de sesión en caso de LOGOUT forzado por WhatsApp
+// ─────────────────────────────────────────────────────────────────────────────
+function cleanAuthDir() {
+  try {
+    if (fs.existsSync(config.authPath)) {
+      fs.rmSync(config.authPath, { recursive: true, force: true });
+      logger.info(`[WA] Directorio de sesión eliminado: ${config.authPath}`);
+    }
+  } catch (err) {
+    logger.error(`[WA] Error limpiando auth dir: ${err.message}`);
+  }
+}
+
 export function getQR() { return qrCode; }
 export function isClientReady() { return isReady; }
 export function getClient() { return client; }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Procesar un mensaje entrante (unificado: usado por evento Y por poller)
-// ─────────────────────────────────────────────────────────────────────────────
-async function processIncomingMessage(msg, source = 'event') {
-  try {
-    if (msg.fromMe) return;
-    if (!isValidClientJid(msg.from)) return;
-
-    const msgId = msg.id?._serialized || msg.id?.id;
-    if (wasProcessed(msgId)) return;
-    markProcessed(msgId);
-
-    // Ignorar muy antiguos
-    if (msg.timestamp && msg.timestamp < (readyTimestamp - OLD_MESSAGE_THRESHOLD_SEC)) {
-      return;
-    }
-
-    const text = (msg.body || '').trim();
-    if (!text) return;
-
-    const userId = msg.from;
-    const pushName = msg._data?.notifyName || msg.notifyName || '';
-
-    logger.info(`[WA:${source}] ← ${userId} (${pushName}): ${text.substring(0, 60)}`);
-    if (_onClientMessage) {
-      await _onClientMessage({ userId, text, pushName });
-    }
-  } catch (err) {
-    logger.error(`[WA] Error procesando mensaje: ${err.message}`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POLLER de fallback — revisa chats con mensajes no leídos cada 5 segundos
-// Crítico para mitigar el bug de whatsapp-web.js #5765 donde los eventos
-// 'message' no se disparan confiablemente.
-// ─────────────────────────────────────────────────────────────────────────────
-async function runPoller() {
-  if (!isReady || !client) return;
-
-  try {
-    const chats = await client.getChats();
-    for (const chat of chats) {
-      if (!chat.unreadCount || chat.unreadCount < 1) continue;
-      if (!isValidClientJid(chat.id?._serialized)) continue;
-
-      // Trae los últimos N mensajes del chat (N = unreadCount)
-      const messages = await chat.fetchMessages({ limit: chat.unreadCount });
-      for (const msg of messages) {
-        await processIncomingMessage(msg, 'poll');
-      }
-    }
-  } catch (err) {
-    logger.error(`[WA:Poller] Error: ${err.message}`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────────────────────────────────────
 export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
-  _onClientMessage = onClientMessage;
-
   const puppeteerConfig = {
     headless: true,
     args: [
@@ -150,31 +91,53 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
   client.on('ready', () => {
     isReady = true;
     qrCode = null;
-    readyTimestamp = Math.floor(Date.now() / 1000);
-    logger.info(`[WA] ✅ WhatsApp conectado y listo (readyTs=${readyTimestamp})`);
-
-    // Arrancar poller cada 5s como fallback
-    setInterval(runPoller, 5_000);
-    logger.info('[WA] Poller de fallback iniciado (intervalo: 5s)');
+    logger.info('[WA] ✅ WhatsApp conectado y listo');
   });
 
   client.on('authenticated', () => logger.info('[WA] Autenticado'));
   client.on('auth_failure', (msg) => logger.error(`[WA] Auth failure: ${msg}`));
 
-  client.on('disconnected', (reason) => {
+  // CRÍTICO: cuando WhatsApp manda LOGOUT, la sesión guardada quedó inválida.
+  // NO intentar reconectar con la misma sesión — limpiar el directorio y
+  // dejar que el siguiente initialize() genere un QR nuevo.
+  client.on('disconnected', async (reason) => {
     isReady = false;
     logger.warn(`[WA] Desconectado: ${reason}`);
+
+    if (reason === 'LOGOUT') {
+      logger.warn('[WA] Logout detectado — limpiando sesión para re-escaneo');
+      try {
+        await client.destroy().catch(() => {});
+      } catch (_) {}
+      cleanAuthDir();
+    }
+
     setTimeout(() => {
       client.initialize().catch(err => logger.error(`[WA] Reconexión fallida: ${err.message}`));
     }, 5000);
   });
 
-  // ── Mensajes ENTRANTES (evento en tiempo real) ──────────────────────────────
+  // ── Mensajes ENTRANTES del cliente ──────────────────────────────────────────
   client.on('message', async (msg) => {
-    await processIncomingMessage(msg, 'evt');
+    try {
+      if (msg.fromMe) return;
+      if (!isValidClientJid(msg.from)) return;
+
+      const text = msg.body?.trim();
+      if (!text) return;
+
+      const userId = msg.from;
+      const pushName = msg._data?.notifyName || '';
+
+      logger.info(`[WA] ← ${userId} (${pushName}): ${text.substring(0, 60)}`);
+      await onClientMessage({ userId, text, pushName });
+
+    } catch (err) {
+      logger.error(`[WA] Error en message: ${err.message}`);
+    }
   });
 
-  // ── Mensajes SALIENTES ─────────────────────────────────────────────────────
+  // ── Mensajes SALIENTES — distinguir bot vs asesor por msg.id ────────────────
   client.on('message_create', async (msg) => {
     try {
       if (!msg.fromMe) return;
@@ -187,6 +150,7 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
       const clientUserId = msg.to;
       logger.info(`[WA] → Gerardo escribió a ${clientUserId}: ${(msg.body || '').substring(0, 60)}`);
       await onAdvisorMessage({ clientUserId });
+
     } catch (err) {
       logger.error(`[WA] Error en message_create: ${err.message}`);
     }
@@ -196,7 +160,7 @@ export async function initWhatsApp(onClientMessage, onAdvisorMessage) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WhatsAppService
+// WhatsAppService — API pública
 // ─────────────────────────────────────────────────────────────────────────────
 export const WhatsAppService = {
 
@@ -217,10 +181,8 @@ export const WhatsAppService = {
 
       if (msgId) {
         registerBotMessage(msgId);
-        logger.info(`[WA] → Enviado a ${to} (ID: ${msgId.slice(-8)})`);
-      } else {
-        logger.warn(`[WA] Mensaje enviado a ${to} sin ID retornado`);
       }
+      logger.info(`[WA] → Enviado a ${to}${msgId ? ` (${msgId.slice(-8)})` : ''}`);
     } catch (err) {
       logger.error(`[WA] Error enviando a ${to}: ${err.message}`);
     }
