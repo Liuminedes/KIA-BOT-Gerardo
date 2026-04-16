@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["chromium-browser", "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libgbm1", "libasound2t64", "libpangocairo-1.0-0", "libxss1", "libgtk-3-0", "libxshmfence1", "libglu1"]
+nixPkgs = ["nodejs_22", "chromium", "nss", "freetype", "harfbuzz", "glib", "nss_latest"]
 
 [phases.install]
 cmds = ["npm ci"]
