@@ -1,10 +1,11 @@
-import {
-  default as makeWASocket,
+import baileys from '@whiskeysockets/baileys';
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
   makeCacheableSignalKeyStore,
-} from '@whiskeysockets/baileys';
+} = baileys;
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
