@@ -9,7 +9,6 @@ const {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
-import path from 'path';
 import { logger } from '../config/logger.js';
 import { config } from '../config/env.js';
 
