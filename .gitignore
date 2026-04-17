@@ -1,26 +1,8 @@
-# Dependencies
 node_modules/
-
-# WhatsApp Web session (NUNCA subir al repo)
-wwebjs_auth/
-.wwebjs_auth/
-.wwebjs_cache/
-
-# Logs
-logs/
-*.log
-npm-debug.log*
-
-# Environment
 .env
-.env.local
-.env.*.local
-
-# OS
+auth/
+logs/*.log
+*.log
 .DS_Store
-Thumbs.db
-
-# Editor
 .vscode/
 .idea/
-*.swp

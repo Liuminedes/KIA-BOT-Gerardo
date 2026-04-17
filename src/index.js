@@ -1,11 +1,11 @@
 import express from 'express';
-import morgan  from 'morgan';
-import { config }          from './config/env.js';
-import { logger }          from './config/logger.js';
-import { getRedisClient }  from './config/redis.js';
-import { initWhatsApp }    from './services/whatsapp.service.js';
+import morgan from 'morgan';
+import { config } from './config/env.js';
+import { logger } from './config/logger.js';
+import { getRedisClient } from './config/redis.js';
+import { initWhatsApp } from './services/whatsapp.service.js';
 import { handleMessage, handleAdvisorMessage } from './flows/conversation.flow.js';
-import adminRoutes         from './routes/admin.routes.js';
+import adminRoutes from './routes/admin.routes.js';
 
 const app = express();
 
@@ -15,15 +15,19 @@ app.use(morgan(config.isDev ? 'dev' : 'combined', {
   stream: { write: (msg) => logger.http(msg.trim()) },
 }));
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health check (para ping desde cron-job.org) ──────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    advisor: config.advisor.name,
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// ── Admin panel ───────────────────────────────────────────────────────────────
+// ── Admin panel ──────────────────────────────────────────────────────────────
 app.use('/admin', adminRoutes);
 
-// ── 404 ───────────────────────────────────────────────────────────────────────
+// ── 404 y error handler ──────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
 app.use((err, _req, res, _next) => {
@@ -31,7 +35,7 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
+// ── Bootstrap ────────────────────────────────────────────────────────────────
 async function bootstrap() {
   try {
     const redis = getRedisClient();
@@ -39,27 +43,24 @@ async function bootstrap() {
     logger.info('[Server] Redis OK');
 
     app.listen(config.port, () => {
-      logger.info(`[Server] KIA Bot Gerardo v1.0 — puerto ${config.port} (${config.nodeEnv})`);
+      logger.info(`[Server] KIA Bot — Asesor: ${config.advisor.name}`);
+      logger.info(`[Server] Puerto ${config.port} (${config.nodeEnv})`);
       logger.info(`[Server] Admin panel: GET /admin?token=TU_TOKEN`);
       logger.info(`[Server] Health check: GET /health`);
     });
 
-    logger.info('[Server] Iniciando WhatsApp Web...');
+    logger.info('[Server] Iniciando WhatsApp con Baileys...');
     await initWhatsApp(
-      // Mensaje ENTRANTE del cliente
+      // ── Mensaje entrante del cliente ────────────────────────────────────────
       async ({ userId, text, pushName }) => {
-        const advisorJid = config.advisor.phone ? `${config.advisor.phone}@c.us` : null;
-        if (advisorJid && userId === advisorJid) return;
         await handleMessage({ userId, text, pushName }).catch(err => {
-          logger.error(`[Flow] Error handleMessage: ${err.message}`);
+          logger.error(`[Flow] Error en handleMessage: ${err.message}`);
         });
       },
-      // Mensaje SALIENTE del asesor detectado
-      async ({ clientUserId }) => {
-        const advisorJid = config.advisor.phone ? `${config.advisor.phone}@c.us` : null;
-        if (advisorJid && clientUserId === advisorJid) return;
-        await handleAdvisorMessage({ clientUserId }).catch(err => {
-          logger.error(`[Flow] Error handleAdvisorMessage: ${err.message}`);
+      // ── Mensaje saliente detectado como manual (asesor escribió) ───────────
+      async ({ clientUserId, text }) => {
+        await handleAdvisorMessage({ clientUserId, text }).catch(err => {
+          logger.error(`[Flow] Error en handleAdvisorMessage: ${err.message}`);
         });
       }
     );

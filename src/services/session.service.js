@@ -1,37 +1,76 @@
 import { getRedisClient } from '../config/redis.js';
 import { logger } from '../config/logger.js';
+import { config } from '../config/env.js';
+import { ACTIVATION_MODE, PAUSED_MODES, STEPS } from '../flows/steps.js';
 
-const PREFIX        = 'kia:session:';
-const PAUSED_PREFIX = 'kia:paused:';
-const TTL           = 60 * 60 * 6; // 6 horas
+const PREFIX          = 'kia:session:';
+const PAUSED_PREFIX   = 'kia:paused:';          // pausa global por admin
+const EXCLUDED_KEY    = 'kia:excluded';
+
+// TTL en segundos (ioredis setex usa segundos)
+const TTL_SEC = Math.floor(config.redis.sessionTtlMs / 1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// initiatedBy: indica quién abrió la conversación
-//   'bot'     → el cliente escribió primero, bot activó el flujo
-//   'advisor' → Gerardo escribió primero, bot nació pausado
-//   null      → sesión nueva sin determinar aún (no debería quedar en este estado)
+// MODELO DE SESIÓN POR DEFECTO
 // ─────────────────────────────────────────────────────────────────────────────
 function defaultSession(userId) {
   return {
     userId,
-    step:         'WELCOME',
-    initiatedBy:  null,    // 'bot' | 'advisor'
+    pushName: null,
+    step: STEPS.WELCOME,
     lead: {
-      name:         null,
-      phone:        null,
-      interest:     null,
-      budget:       null,
-      employment:   null,
-      income:       null,
+      name: null,
+      phone: null,
+      interest: null,
+      budget: null,
+      employment: null,
+      income: null,
       creditStatus: null,
     },
-    handoffMode:  false,   // flujo completo terminado → bot silencioso
-    bryantook:    false,   // asesor tomó/interrumpió → bot silencioso
-    pushName:     null,
-    updatedAt:    Date.now(),
+    activationMode: ACTIVATION_MODE.ACTIVE,
+    // Timestamps del ciclo de vida
+    createdAt:            Date.now(),
+    updatedAt:            Date.now(),
+    lastClientMessageAt:  null,  // última vez que el cliente escribió
+    pausedAt:             null,  // cuándo quedó en algún estado pausado
+    armedAt:              null,  // cuándo el asesor activó ARMED_BY_ADVISOR
+    // Quién inició el contacto: 'CLIENT' o 'ADVISOR'
+    firstContactBy:       null,
+    // Flag interno para flujo handoff directo
+    pendingDirectHandoff: false,
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MIGRACIÓN: sesiones viejas con bryantook/handoffMode → activationMode
+// Se aplica automáticamente al leer cada sesión.
+// ─────────────────────────────────────────────────────────────────────────────
+function migrateLegacySession(session) {
+  // Ya está en formato nuevo
+  if (session.activationMode) return session;
+
+  let mode = ACTIVATION_MODE.ACTIVE;
+  if (session.bryantook)   mode = ACTIVATION_MODE.PAUSED_BY_ADVISOR;
+  if (session.handoffMode) mode = ACTIVATION_MODE.PAUSED_HANDOFF;
+
+  session.activationMode = mode;
+  session.createdAt            = session.createdAt            || session.updatedAt || Date.now();
+  session.lastClientMessageAt  = session.lastClientMessageAt  || null;
+  session.pausedAt             = PAUSED_MODES.has(mode) ? (session.updatedAt || Date.now()) : null;
+  session.armedAt              = null;
+  session.firstContactBy       = session.firstContactBy       || 'CLIENT';
+  session.pendingDirectHandoff = session.pendingDirectHandoff || false;
+
+  // Limpiar campos viejos (ya mapeados)
+  delete session.bryantook;
+  delete session.handoffMode;
+
+  return session;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVICIO PRINCIPAL
+// ─────────────────────────────────────────────────────────────────────────────
 export const SessionService = {
 
   async get(userId) {
@@ -39,10 +78,21 @@ export const SessionService = {
     try {
       const raw = await redis.get(`${PREFIX}${userId}`);
       if (!raw) return defaultSession(userId);
-      return JSON.parse(raw);
+      return migrateLegacySession(JSON.parse(raw));
     } catch (err) {
       logger.error(`[Session] get error: ${err.message}`);
       return defaultSession(userId);
+    }
+  },
+
+  // Verifica si existe la sesión (distinto de get — get siempre devuelve objeto)
+  async exists(userId) {
+    const redis = getRedisClient();
+    try {
+      return (await redis.exists(`${PREFIX}${userId}`)) === 1;
+    } catch (err) {
+      logger.error(`[Session] exists error: ${err.message}`);
+      return false;
     }
   },
 
@@ -50,7 +100,7 @@ export const SessionService = {
     const redis = getRedisClient();
     try {
       session.updatedAt = Date.now();
-      await redis.setex(`${PREFIX}${session.userId}`, TTL, JSON.stringify(session));
+      await redis.setex(`${PREFIX}${session.userId}`, TTL_SEC, JSON.stringify(session));
     } catch (err) {
       logger.error(`[Session] save error: ${err.message}`);
     }
@@ -60,67 +110,91 @@ export const SessionService = {
     const redis = getRedisClient();
     try {
       await redis.del(`${PREFIX}${userId}`);
-      logger.info(`[Session] Reset completo: ${userId}`);
+      logger.info(`[Session] Reset: ${userId}`);
     } catch (err) {
       logger.error(`[Session] reset error: ${err.message}`);
     }
   },
 
-  // Marcar que el asesor tomó esta conversación (interrupción manual)
-  async advisorTook(userId) {
-    const session = await this.get(userId);
-    session.bryantook = true;
-    await this.save(session);
-    logger.info(`[Session] Asesor tomó conversación: ${userId}`);
+  // ── Helpers de transición de estado ────────────────────────────────────────
+
+  // El cliente acaba de escribir — actualizar timestamp
+  markClientMessage(session) {
+    session.lastClientMessageAt = Date.now();
+    if (!session.firstContactBy) session.firstContactBy = 'CLIENT';
   },
 
-  // Marcar que el asesor INICIÓ esta conversación (escribió antes que el cliente)
-  // Esto setea bryantook=true desde el arranque
-  async markAdvisorInitiated(userId) {
-    const session = await this.get(userId);
-    // Solo marcar si la sesión es completamente nueva
-    if (session.initiatedBy === null) {
-      session.initiatedBy = 'advisor';
-      session.bryantook   = true;
-      await this.save(session);
-      logger.info(`[Session] Conversación iniciada por el asesor: ${userId}`);
+  // El asesor interrumpió al bot mientras ya conversaba con el cliente
+  markPausedByAdvisor(session) {
+    session.activationMode = ACTIVATION_MODE.PAUSED_BY_ADVISOR;
+    session.pausedAt       = Date.now();
+    session.armedAt        = null;
+  },
+
+  // El asesor escribió primero a un cliente nuevo — bot queda armado
+  markArmedByAdvisor(session) {
+    session.activationMode = ACTIVATION_MODE.ARMED_BY_ADVISOR;
+    session.armedAt        = Date.now();
+    session.pausedAt       = null;
+    if (!session.firstContactBy) session.firstContactBy = 'ADVISOR';
+  },
+
+  // Flujo de calificación completado — lead entregado
+  markHandoffCompleted(session) {
+    session.activationMode = ACTIVATION_MODE.PAUSED_HANDOFF;
+    session.step           = STEPS.HANDOFF;
+    session.pausedAt       = Date.now();
+  },
+
+  // Admin pausó manualmente desde el panel
+  markPausedByAdmin(session) {
+    session.activationMode = ACTIVATION_MODE.PAUSED_ADMIN;
+    session.pausedAt       = Date.now();
+    session.armedAt        = null;
+  },
+
+  // Volver al estado activo (reset suave sin perder pushName/firstContactBy)
+  markActive(session, resetLead = true) {
+    session.activationMode = ACTIVATION_MODE.ACTIVE;
+    session.pausedAt       = null;
+    session.armedAt        = null;
+    session.step           = STEPS.WELCOME;
+    if (resetLead) {
+      session.lead = {
+        name: null, phone: null, interest: null, budget: null,
+        employment: null, income: null, creditStatus: null,
+      };
     }
+    session.pendingDirectHandoff = false;
   },
 
-  // Marcar que el cliente inició (bot activo)
-  async markBotInitiated(userId) {
-    const session = await this.get(userId);
-    if (session.initiatedBy === null) {
-      session.initiatedBy = 'bot';
-      await this.save(session);
-    }
-    return session;
+  // ── Heurísticas de tiempo ──────────────────────────────────────────────────
+
+  isPaused(session) {
+    return PAUSED_MODES.has(session.activationMode);
   },
 
-  // Reactivar bot después de handoff completo — mantiene datos del lead
-  async reactivateAfterHandoff(userId) {
-    const session = await this.get(userId);
-    const leadName = session.lead?.name || null;
-    session.handoffMode = false;
-    session.bryantook   = false;
-    session.step        = 'MENU';
-    // Conserva el lead completo para personalizar el saludo
-    await this.save(session);
-    logger.info(`[Session] Reactivado post-handoff: ${userId}`);
-    return { session, leadName };
+  // ¿Pasó suficiente tiempo desde pausedAt para mandar mensaje de reconexión?
+  shouldReawaken(session) {
+    if (!this.isPaused(session)) return false;
+    if (!session.pausedAt) return false;
+    return (Date.now() - session.pausedAt) >= config.timings.reawakenAfterMs;
   },
 
-  // Reactivar bot después de interrupción del asesor — flujo desde cero
-  async reactivateAfterAdvisor(userId) {
-    const session       = defaultSession(userId);
-    session.initiatedBy = 'bot'; // ahora el cliente toma control
-    session.userId      = userId;
-    await this.save(session);
-    logger.info(`[Session] Reactivado post-asesor: ${userId}`);
-    return session;
+  // ¿La sesión armada expiró la ventana de seguridad?
+  isArmedWindowExpired(session) {
+    if (session.activationMode !== ACTIVATION_MODE.ARMED_BY_ADVISOR) return false;
+    if (!session.armedAt) return true;
+    return (Date.now() - session.armedAt) > config.timings.armedWindowMs;
   },
 
-  // Pausa global desde admin
+  // ¿El cliente nunca ha escrito a este chat?
+  hasClientEverMessaged(session) {
+    return session.lastClientMessageAt != null;
+  },
+
+  // ── Pausa global (admin panel) ─────────────────────────────────────────────
+
   async setPausedGlobal(paused) {
     const redis = getRedisClient();
     await redis.set(`${PAUSED_PREFIX}global`, paused ? '1' : '0');
@@ -128,29 +202,33 @@ export const SessionService = {
 
   async isGloballyPaused() {
     const redis = getRedisClient();
-    const val   = await redis.get(`${PAUSED_PREFIX}global`);
+    const val = await redis.get(`${PAUSED_PREFIX}global`);
     return val === '1';
   },
 
-  // Listar sesiones activas
+  // ── Listar sesiones activas (para panel admin) ────────────────────────────
+
   async listActive() {
-    const redis    = getRedisClient();
-    const keys     = await redis.keys(`${PREFIX}*`);
+    const redis = getRedisClient();
+    const keys = await redis.keys(`${PREFIX}*`);
     const sessions = [];
     for (const key of keys) {
       const raw = await redis.get(key);
       if (raw) {
-        try { sessions.push(JSON.parse(raw)); } catch (_) {}
+        try {
+          sessions.push(migrateLegacySession(JSON.parse(raw)));
+        } catch (_) {}
       }
     }
     return sessions;
   },
 
-  // ── Números excluidos ─────────────────────────────────────────────────────
+  // ── Números excluidos del bot ──────────────────────────────────────────────
+
   async getExcludedNumbers() {
     const redis = getRedisClient();
     try {
-      const raw = await redis.get('kia:excluded');
+      const raw = await redis.get(EXCLUDED_KEY);
       return raw ? JSON.parse(raw) : [];
     } catch (err) {
       logger.error(`[Session] getExcluded error: ${err.message}`);
@@ -159,29 +237,31 @@ export const SessionService = {
   },
 
   async addExcludedNumber(number) {
-    const list  = await this.getExcludedNumbers();
-    const clean = number.replace(/\D/g, '');
+    const list = await this.getExcludedNumbers();
+    const clean = String(number).replace(/\D/g, '');
     if (!clean || list.includes(clean)) return list;
     list.push(clean);
     const redis = getRedisClient();
-    await redis.set('kia:excluded', JSON.stringify(list));
+    await redis.set(EXCLUDED_KEY, JSON.stringify(list));
     logger.info(`[Session] Número excluido: ${clean}`);
     return list;
   },
 
   async removeExcludedNumber(number) {
-    const list    = await this.getExcludedNumbers();
-    const clean   = number.replace(/\D/g, '');
+    const list = await this.getExcludedNumbers();
+    const clean = String(number).replace(/\D/g, '');
     const updated = list.filter(n => n !== clean);
-    const redis   = getRedisClient();
-    await redis.set('kia:excluded', JSON.stringify(updated));
+    const redis = getRedisClient();
+    await redis.set(EXCLUDED_KEY, JSON.stringify(updated));
     logger.info(`[Session] Número removido de excluidos: ${clean}`);
     return updated;
   },
 
   async isExcluded(userId) {
-    const list  = await this.getExcludedNumbers();
-    const phone = userId.replace(/@.*$/, '');
-    return list.some(n => n === userId || n === phone || phone.includes(n) || n.includes(phone));
+    const list = await this.getExcludedNumbers();
+    const phone = String(userId).replace(/@.*$/, '').replace(/:.*$/, '');
+    return list.some(n =>
+      n === userId || n === phone || phone.includes(n) || n.includes(phone)
+    );
   },
 };

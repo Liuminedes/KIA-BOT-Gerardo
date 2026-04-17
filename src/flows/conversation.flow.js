@@ -1,12 +1,12 @@
-import { WhatsAppService }  from '../services/whatsapp.service.js';
-import { SessionService }   from '../services/session.service.js';
-import { logger }           from '../config/logger.js';
-import { config }           from '../config/env.js';
+import { WhatsAppService } from '../services/whatsapp.service.js';
+import { SessionService } from '../services/session.service.js';
+import { logger } from '../config/logger.js';
+import { config } from '../config/env.js';
 import {
   STEPS,
+  ACTIVATION_MODE,
   RESET_KEYWORDS,
   HANDOFF_KEYWORDS,
-  REACTIVATION_KEYWORDS,
   KIA_VEHICLES_FLAT,
   VEHICLE_TYPE_MAP,
   VEHICLE_INDEX_BY_TYPE,
@@ -17,94 +17,85 @@ import { MSG } from './messages.js';
 
 const CREDIT_MAP = { '1': 'clean', '2': 'reported', '3': 'unknown' };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRADA PRINCIPAL — mensaje del cliente
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// ENTRADA PRINCIPAL — MENSAJE DEL CLIENTE
+// ═════════════════════════════════════════════════════════════════════════════
 export async function handleMessage({ userId, text, pushName }) {
-  await WhatsAppService.markAsRead();
+  // ── 1. Pausa global admin ──────────────────────────────────────────────────
+  if (await SessionService.isGloballyPaused()) return;
 
-  // Pausa global desde admin
-  const globallyPaused = await SessionService.isGloballyPaused();
-  if (globallyPaused) return;
-
-  const advisorJid = config.advisor.phone ? `${config.advisor.phone}@c.us` : null;
-
-  // Ignorar mensajes del propio asesor
-  if (advisorJid && userId === advisorJid) {
-    logger.debug(`[Flow] Mensaje del asesor ignorado`);
-    return;
-  }
-
-  // Ignorar números excluidos
-  const excluded = await SessionService.isExcluded(userId);
-  if (excluded) {
+  // ── 2. Número excluido ─────────────────────────────────────────────────────
+  if (await SessionService.isExcluded(userId)) {
     logger.debug(`[Flow] Número excluido: ${userId}`);
     return;
   }
 
-  // Marcar que el cliente inició si aún no hay initiatedBy
-  // (si el asesor ya lo marcó como 'advisor', esto no sobreescribe)
-  await SessionService.markBotInitiated(userId);
-
   const session  = await SessionService.get(userId);
   const input    = (text || '').trim().toLowerCase();
-
-  // Guardar pushName
-  if (pushName && !session.pushName) {
-    session.pushName = pushName;
-    await SessionService.save(session);
-  }
-
-  logger.debug(`[Flow] ${userId} step=${session.step} bryantook=${session.bryantook} handoffMode=${session.handoffMode} initiatedBy=${session.initiatedBy}`);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // BLOQUE 1: Bot pausado por handoff completo
-  // El cliente ya pasó por todo el flujo y fue transferido a Gerardo
-  // ─────────────────────────────────────────────────────────────────────────
-  if (session.handoffMode) {
-    const isReactivation = REACTIVATION_KEYWORDS.some(kw => input.includes(kw));
-    if (isReactivation) {
-      // Reactivar manteniendo los datos del lead — volver a MENU
-      const { leadName } = await SessionService.reactivateAfterHandoff(userId);
-      await WhatsAppService.sendText(userId, MSG.reactivatedAfterHandoff(leadName));
-      await delay(500);
-      return WhatsAppService.sendText(userId, MSG.menu());
-    }
-    // Sin keyword → silencio total
-    return;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // BLOQUE 2: Gerardo tomó o inició la conversación (bryantook)
-  // ─────────────────────────────────────────────────────────────────────────
-  if (session.bryantook) {
-    const isReactivation = REACTIVATION_KEYWORDS.some(kw => input.includes(kw));
-    if (isReactivation) {
-      // Reactivar desde cero — flujo normal
-      await SessionService.reactivateAfterAdvisor(userId);
-      await WhatsAppService.sendText(userId, MSG.reactivatedAfterAdvisor());
-      await delay(500);
-      return WhatsAppService.sendText(userId, MSG.menu());
-    }
-    // Sin keyword → silencio total
-    return;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // BLOQUE 3: Bot activo — flujo normal
-  // ─────────────────────────────────────────────────────────────────────────
-
   const inputNum = input.replace(/[^\d]/g, '');
 
-  // Keywords de reset (solo cuando el bot está activo)
-  if (RESET_KEYWORDS.includes(input)) {
-    session.step = STEPS.WELCOME;
-    session.lead = { name: null, phone: null, interest: null, budget: null, employment: null, income: null, creditStatus: null };
+  // Marcar que el cliente escribió (para distinguir cliente nuevo vs recurrente)
+  SessionService.markClientMessage(session);
+
+  // Guardar pushName la primera vez
+  if (pushName && !session.pushName) session.pushName = pushName;
+
+  // ── 3. Estado ARMED_BY_ADVISOR: el asesor escribió primero, ahora responde
+  //      el cliente. Hay que "despertar" el bot con el menú de transición.
+  if (session.activationMode === ACTIVATION_MODE.ARMED_BY_ADVISOR) {
+    // Si pasó mucho tiempo desde el armado, tratar como cliente nuevo
+    if (SessionService.isArmedWindowExpired(session)) {
+      logger.info(`[Flow] Ventana armada expiró para ${userId} — tratando como nuevo`);
+      SessionService.markActive(session, true);
+      await SessionService.save(session);
+      return handleWelcome(userId, session, text, pushName);
+    }
+
+    logger.info(`[Flow] 🎯 Cliente responde tras armado por asesor: ${userId}`);
+    session.activationMode = ACTIVATION_MODE.ACTIVE;
+    session.step           = STEPS.MENU;
+    session.armedAt        = null;
     await SessionService.save(session);
-    return WhatsAppService.sendText(userId, MSG.bryanIntroduced());
+    return WhatsAppService.sendText(userId, MSG.armedHandoff());
   }
 
-  // Keywords de handoff directo (en cualquier punto del flujo activo)
+  // ── 4. Estados pausados (ADVISOR, HANDOFF, ADMIN) ─────────────────────────
+  if (SessionService.isPaused(session)) {
+
+    // ── 4a. Reset manual explícito ("menu") siempre disponible ──────────────
+    if (RESET_KEYWORDS.includes(input)) {
+      SessionService.markActive(session, true);
+      await SessionService.save(session);
+      return handleWelcome(userId, session, text, pushName);
+    }
+
+    // ── 4b. REAWAKEN: pasaron >48h sin respuesta, mandar opciones de reconexión
+    if (SessionService.shouldReawaken(session)) {
+      logger.info(`[Flow] ⏰ Reawaken para ${userId} tras ${formatHours(Date.now() - session.pausedAt)}h`);
+      session.step = STEPS.REAWAKEN_CHOICE;
+      // NO cambiar activationMode todavía — si el cliente ignora, seguimos pausados
+      await SessionService.save(session);
+      return WhatsAppService.sendText(userId, MSG.reawaken(session.lead?.name || session.pushName));
+    }
+
+    // ── 4c. Todavía dentro de la ventana de pausa: bot silencioso ──────────
+    await SessionService.save(session);
+    return;
+  }
+
+  // ── 5. Paso especial: el cliente está eligiendo en el menú de reawaken ────
+  if (session.step === STEPS.REAWAKEN_CHOICE) {
+    return handleReawakenChoice(userId, session, inputNum, input);
+  }
+
+  // ── 6. Keywords globales de reset ──────────────────────────────────────────
+  if (RESET_KEYWORDS.includes(input)) {
+    SessionService.markActive(session, true);
+    await SessionService.save(session);
+    return handleWelcome(userId, session, text, pushName);
+  }
+
+  // ── 7. Keywords de handoff directo (después del menú inicial) ─────────────
   if (
     session.step !== STEPS.WELCOME &&
     HANDOFF_KEYWORDS.some(kw => input.includes(kw))
@@ -112,6 +103,9 @@ export async function handleMessage({ userId, text, pushName }) {
     return triggerHandoffDirect(userId, session);
   }
 
+  logger.debug(`[Flow] ${userId} step=${session.step} mode=${session.activationMode} input="${input.substring(0, 40)}"`);
+
+  // ── 8. Máquina de estados del flujo de calificación ────────────────────────
   switch (session.step) {
     case STEPS.WELCOME:            return handleWelcome(userId, session, text, pushName);
     case STEPS.MENU:               return handleMenu(userId, session, inputNum, input);
@@ -129,43 +123,58 @@ export async function handleMessage({ userId, text, pushName }) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MENSAJE DEL ASESOR (saliente detectado en whatsapp.service)
-// Dos escenarios:
-//   A) Gerardo escribió a alguien que NUNCA tuvo sesión → markAdvisorInitiated
-//   B) Gerardo interrumpió una conversación activa del bot → bryantook = true
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// ENTRADA SECUNDARIA — MENSAJE DEL ASESOR (saliente detectado)
+// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Lógica clave:
+ *
+ *   - Si el cliente NUNCA ha escrito al chat → asumimos que el asesor está
+ *     rompiendo el hielo. El bot queda ARMADO y cuando el cliente responda
+ *     aparecerá con un menú de transición.
+ *
+ *   - Si el cliente YA escribió antes → el asesor está interrumpiendo al bot.
+ *     Pausamos el bot (PAUSED_BY_ADVISOR).
+ *
+ *   - Si el bot YA estaba armado o pausado → no hacemos nada (el asesor sigue
+ *     escribiendo mientras espera al cliente, no queremos cambiar el estado
+ *     cada vez).
+ */
 export async function handleAdvisorMessage({ clientUserId }) {
+  const existed = await SessionService.exists(clientUserId);
   const session = await SessionService.get(clientUserId);
 
-  // Si ya está pausado por cualquier motivo — no hacer nada
-  if (session.bryantook || session.handoffMode) {
-    logger.debug(`[Flow] Asesor escribió pero ya estaba pausado para ${clientUserId}`);
+  // Si el bot ya está en un estado no-activo, no tocar nada
+  if (session.activationMode !== ACTIVATION_MODE.ACTIVE) {
+    logger.debug(`[Flow] Asesor escribió a ${clientUserId} pero modo=${session.activationMode}, ignorando`);
     return;
   }
 
-  // Escenario A: sesión nueva — Gerardo inició la conversación
-  if (session.initiatedBy === null || session.initiatedBy === 'advisor') {
-    await SessionService.markAdvisorInitiated(clientUserId);
-    logger.info(`[Flow] Asesor inició conversación con ${clientUserId} — bot nace pausado`);
-    return;
-  }
+  const clientHasMessaged = SessionService.hasClientEverMessaged(session);
 
-  // Escenario B: bot estaba activo — Gerardo interrumpió
-  session.bryantook = true;
-  await SessionService.save(session);
-  logger.info(`[Flow] Asesor interrumpió conversación activa con ${clientUserId} — bot pausado`);
+  if (!existed || !clientHasMessaged) {
+    // ── CASO A: Asesor rompe el hielo ──────────────────────────────────────
+    SessionService.markArmedByAdvisor(session);
+    await SessionService.save(session);
+    logger.info(`[Flow] 🎯 Asesor rompió el hielo con ${clientUserId} — bot ARMADO`);
+  } else {
+    // ── CASO B: Asesor interrumpe al bot ───────────────────────────────────
+    SessionService.markPausedByAdvisor(session);
+    await SessionService.save(session);
+    logger.info(`[Flow] ⏸️  Asesor interrumpió al bot con ${clientUserId}`);
+  }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HANDLERS DEL FLUJO
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// HANDLERS DE PASOS
+// ═════════════════════════════════════════════════════════════════════════════
 
-async function handleWelcome(userId, session, text, pushName) {
-  session.step = STEPS.MENU;
+async function handleWelcome(userId, session, _text, pushName) {
+  session.step           = STEPS.MENU;
+  session.activationMode = ACTIVATION_MODE.ACTIVE;
   if (pushName) session.pushName = pushName;
   await SessionService.save(session);
-  await WhatsAppService.sendText(userId, MSG.bryanIntroduced());
+  await WhatsAppService.sendText(userId, MSG.advisorIntroduced());
   await delay(600);
   return WhatsAppService.sendText(userId, MSG.menu());
 }
@@ -197,7 +206,7 @@ async function handleCatalogType(userId, session, inputNum, input) {
     else return WhatsAppService.sendText(userId, MSG.catalogType());
   }
   session.catalogType = tipo;
-  session.step        = STEPS.INFO_VEHICLES;
+  session.step = STEPS.INFO_VEHICLES;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.vehiclesList(session.lead.name || '', tipo));
 }
@@ -209,18 +218,20 @@ async function handleVehicleSelection(userId, session, inputNum, text) {
 
   if (selected) {
     session.lead.interest = selected.title;
-    session.step          = STEPS.VEHICLE_DETAIL;
+    session.step = STEPS.VEHICLE_DETAIL;
     await SessionService.save(session);
     await WhatsAppService.sendText(userId, MSG.vehicleDetail(selected));
     await delay(500);
-    await WhatsAppService.sendText(userId, MSG.portfolioLink());
-    await delay(400);
+    if (config.advisor.portfolioUrl) {
+      await WhatsAppService.sendText(userId, MSG.portfolioLink());
+      await delay(400);
+    }
     return WhatsAppService.sendText(userId, MSG.vehicleDetailOptions());
   }
 
   if (text && text.trim().length > 2 && !/^\d+$/.test(text.trim())) {
     session.lead.interest = text.trim();
-    session.step          = STEPS.CAPTURE_BUDGET;
+    session.step = STEPS.CAPTURE_BUDGET;
     await SessionService.save(session);
     return WhatsAppService.sendText(userId, MSG.askBudget());
   }
@@ -245,18 +256,20 @@ async function handleCaptureInterest(userId, session, inputNum, text, input) {
 
   if (selected) {
     session.lead.interest = selected.title;
-    session.step          = STEPS.VEHICLE_DETAIL;
+    session.step = STEPS.VEHICLE_DETAIL;
     await SessionService.save(session);
     await WhatsAppService.sendText(userId, MSG.vehicleDetail(selected));
     await delay(500);
-    await WhatsAppService.sendText(userId, MSG.portfolioLink());
-    await delay(400);
+    if (config.advisor.portfolioUrl) {
+      await WhatsAppService.sendText(userId, MSG.portfolioLink());
+      await delay(400);
+    }
     return WhatsAppService.sendText(userId, MSG.vehicleDetailOptions());
   }
 
   if (text && text.trim().length > 2 && !/^\d+$/.test(text.trim())) {
     session.lead.interest = text.trim();
-    session.step          = STEPS.CAPTURE_BUDGET;
+    session.step = STEPS.CAPTURE_BUDGET;
     await SessionService.save(session);
     return WhatsAppService.sendText(userId, MSG.askBudget());
   }
@@ -274,7 +287,7 @@ async function handleCaptureBudget(userId, session, inputNum) {
   const budget = BUDGET_MAP[inputNum];
   if (!budget) return WhatsAppService.sendText(userId, MSG.askBudget());
   session.lead.budget = budget;
-  session.step        = STEPS.CAPTURE_EMPLOYMENT;
+  session.step = STEPS.CAPTURE_EMPLOYMENT;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.askEmployment());
 }
@@ -283,7 +296,7 @@ async function handleCaptureEmployment(userId, session, inputNum) {
   const employment = EMPLOYMENT_MAP[inputNum];
   if (!employment) return WhatsAppService.sendText(userId, MSG.invalidEmployment());
   session.lead.employment = employment;
-  session.step            = STEPS.CAPTURE_INCOME;
+  session.step = STEPS.CAPTURE_INCOME;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.askIncome());
 }
@@ -292,7 +305,7 @@ async function handleCaptureIncome(userId, session, text) {
   const income = text?.trim();
   if (!income || income.length < 3) return WhatsAppService.sendText(userId, MSG.invalidIncome());
   session.lead.income = income;
-  session.step        = STEPS.CREDIT_CHECK;
+  session.step = STEPS.CREDIT_CHECK;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.askCreditCheck());
 }
@@ -326,7 +339,7 @@ async function handleAskLeadName(userId, session, text) {
     return WhatsAppService.sendText(userId, MSG.invalidLeadName());
   }
   session.lead.name = name.toLowerCase().replace(/(^|\s)\S/g, l => l.toUpperCase());
-  session.step      = STEPS.ASK_LEAD_PHONE;
+  session.step = STEPS.ASK_LEAD_PHONE;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.askLeadPhone(session.lead.name));
 }
@@ -340,21 +353,64 @@ async function handleAskLeadPhone(userId, session, text) {
 
   if (session.pendingDirectHandoff) {
     session.pendingDirectHandoff = false;
+    await SessionService.save(session);
     return triggerHandoffDirect(userId, session);
   }
 
   await triggerHandoff(userId, session);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HANDOFF COMPLETO — bot queda en silencio hasta que el cliente reactive
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// REAWAKEN — CLIENTE ELIGE EN MENÚ DE RECONEXIÓN
+// ═════════════════════════════════════════════════════════════════════════════
+async function handleReawakenChoice(userId, session, inputNum, input) {
+  // Opción 1: seguir esperando al asesor
+  if (inputNum === '1' || input.includes('asesor') || input.includes(config.advisor.firstName.toLowerCase())) {
+    // Mantener pausa pero refrescar pausedAt para que no vuelva a dispararse
+    // inmediatamente si el cliente sigue escribiendo
+    session.pausedAt = Date.now();
+    session.step = STEPS.HANDOFF;  // step irrelevante pero consistente
+    // activationMode se mantiene en el estado pausado anterior
+    await SessionService.save(session);
+
+    // Notificar al asesor que este cliente volvió a escribir
+    const advisorJid = config.advisor.phone ? `${config.advisor.phone}@s.whatsapp.net` : null;
+    if (advisorJid) {
+      const name = session.lead?.name || session.pushName || 'Cliente';
+      const phoneDisplay = userId.replace(/@.*$/, '').replace(/:.*$/, '');
+      await WhatsAppService.sendText(
+        advisorJid,
+        `🔔 *Cliente retoma contacto*\n` +
+        `━━━━━━━━━━━━━━━━\n` +
+        `👤 *${name}* | 📱 +${phoneDisplay}\n` +
+        `━━━━━━━━━━━━━━━━\n` +
+        `_El cliente escribió tras pausa y quiere seguir contigo._`
+      ).catch(err => logger.error(`[Flow] Error notificando reawaken: ${err.message}`));
+    }
+
+    return WhatsAppService.sendText(userId, MSG.reawakenWaitAdvisor());
+  }
+
+  // Opción 2: volver al menú del bot
+  if (inputNum === '2' || input.includes('catalog') || input.includes('cotiz')) {
+    SessionService.markActive(session, true);
+    // Conservar el nombre si ya lo teníamos
+    await SessionService.save(session);
+    return handleWelcome(userId, session, null, session.pushName);
+  }
+
+  // Respuesta no válida — repetir
+  return WhatsAppService.sendText(userId, MSG.reawaken(session.lead?.name || session.pushName));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HANDOFF COMPLETO (flujo calificado)
+// ═════════════════════════════════════════════════════════════════════════════
 async function triggerHandoff(userId, session) {
-  session.handoffMode = true;
-  session.step        = STEPS.HANDOFF;
+  SessionService.markHandoffCompleted(session);
   await SessionService.save(session);
 
-  const advisorJid = config.advisor.phone ? `${config.advisor.phone}@c.us` : null;
+  const advisorJid = config.advisor.phone ? `${config.advisor.phone}@s.whatsapp.net` : null;
 
   await WhatsAppService.sendText(userId, MSG.qualified(session.lead));
   await delay(800);
@@ -368,16 +424,16 @@ async function triggerHandoff(userId, session) {
   logger.info(`[Flow] ✅ Handoff completo para ${userId}`, { lead: session.lead });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HANDOFF DIRECTO — el cliente pidió hablar con Gerardo directamente
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// HANDOFF DIRECTO (opción 3 o keywords — pide datos mínimos antes de entregar)
+// ═════════════════════════════════════════════════════════════════════════════
 async function triggerHandoffDirect(userId, session) {
+  // Si ya tiene nombre y teléfono — notificar directo
   if (session.lead.name && session.lead.phone) {
-    session.handoffMode = true;
-    session.step        = STEPS.HANDOFF;
+    SessionService.markHandoffCompleted(session);
     await SessionService.save(session);
 
-    const advisorJid = config.advisor.phone ? `${config.advisor.phone}@c.us` : null;
+    const advisorJid = config.advisor.phone ? `${config.advisor.phone}@s.whatsapp.net` : null;
     await WhatsAppService.sendText(userId, MSG.handoffDirect());
 
     if (advisorJid) {
@@ -387,14 +443,22 @@ async function triggerHandoffDirect(userId, session) {
     return;
   }
 
+  // Si no tiene nombre/teléfono — pedirlos primero
   await WhatsAppService.sendText(userId, MSG.handoffDirect());
   await delay(600);
-  session.step                = STEPS.ASK_LEAD_NAME;
+  session.step = STEPS.ASK_LEAD_NAME;
   session.pendingDirectHandoff = true;
   await SessionService.save(session);
   return WhatsAppService.sendText(userId, MSG.askLeadName());
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatHours(ms) {
+  return Math.floor(ms / (1000 * 60 * 60));
 }

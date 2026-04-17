@@ -1,3 +1,11 @@
+import { config } from '../config/env.js';
+
+const ADVISOR      = config.advisor.name;
+const ADVISOR_F    = config.advisor.firstName;
+const ADVISOR_URL  = config.advisor.portfolioUrl;
+const ADVISOR_SCH  = config.advisor.schedule;
+const ADVISOR_SEG  = config.advisor.segment;
+
 const firstName = (name) => name?.split(' ')[0] || name || '';
 
 const formatPhone = (phone) => {
@@ -11,9 +19,9 @@ const formatPhone = (phone) => {
 
 export const MSG = {
 
-  // ── Bienvenida inicial ──────────────────────────────────────────────────────
-  bryanIntroduced: () =>
-    `👋 ¡Hola! Soy el asistente de *Gerardo Pineda*.\n\n` +
+  // ── Bienvenida estándar (cliente escribe primero) ───────────────────────────
+  advisorIntroduced: () =>
+    `👋 ¡Hola! Soy el asistente de *${ADVISOR}*.\n\n` +
     `Puedo ayudarte con información de vehículos, precios y más.\n\n` +
     `Selecciona una opción con el número correspondiente 👇`,
 
@@ -21,19 +29,29 @@ export const MSG = {
     `¿En qué te puedo ayudar hoy?\n\n` +
     `*1️⃣* Ver catálogo de vehículos\n` +
     `*2️⃣* Solicitar una cotización\n` +
-    `*3️⃣* Hablar directamente con Gerardo`,
+    `*3️⃣* Hablar directamente con ${ADVISOR_F}`,
 
-  // ── Reactivación post-handoff (cliente ya completó el flujo antes) ──────────
-  // El bot vuelve al menú directamente, sin pedir datos — ya los tiene
-  reactivatedAfterHandoff: (name) =>
-    `👋 ¡Hola de nuevo${name ? `, *${firstName(name)}*` : ''}! 😊\n\n` +
-    `¿En qué más te puedo ayudar?`,
+  // ── Cliente responde al saludo inicial del asesor (ARMED_BY_ADVISOR) ────────
+  armedHandoff: () =>
+    `👋 ¡Hola! Soy el asistente virtual de *${ADVISOR}*.\n\n` +
+    `Mientras ${ADVISOR_F} se conecta contigo, puedo irte ayudando con información ` +
+    `para que aproveches mejor su atención personal 😊\n\n` +
+    `¿Qué prefieres?\n\n` +
+    `*1️⃣* Ver catálogo de vehículos 🚗\n` +
+    `*2️⃣* Solicitar una cotización 💰\n` +
+    `*3️⃣* Seguir esperando a ${ADVISOR_F} ⏳`,
 
-  // ── Reactivación post-asesor (cliente reinicia el bot tras interrupción) ─────
-  reactivatedAfterAdvisor: () =>
-    `👋 ¡Hola! Soy el asistente de *Gerardo Pineda*.\n\n` +
-    `Puedo ayudarte con información de vehículos, precios y más.\n\n` +
-    `Selecciona una opción con el número correspondiente 👇`,
+  // ── Mensaje de reconexión tras pausa larga (REAWAKEN) ───────────────────────
+  reawaken: (name) => {
+    const saludo = name ? `¡Hola de nuevo, *${firstName(name)}*! 👋` : '¡Hola de nuevo! 👋';
+    return (
+      `${saludo}\n\n` +
+      `Veo que ha pasado un tiempo desde nuestra última conversación.\n\n` +
+      `¿Cómo te puedo ayudar ahora?\n\n` +
+      `*1️⃣* Seguir hablando con *${ADVISOR_F}* 👤\n` +
+      `*2️⃣* Ver el catálogo y cotizar 🚗`
+    );
+  },
 
   // ── Catálogo ────────────────────────────────────────────────────────────────
   catalogType: () =>
@@ -45,7 +63,7 @@ export const MSG = {
     `*4️⃣* 🚗 Ver todos los modelos\n\n` +
     `_Todos con garantía de *7 años o 150.000 km* 🛡️_`,
 
-  vehiclesList: (name, tipo) => {
+  vehiclesList: (_name, tipo) => {
     const enc = {
       gasolina:  `Línea *Gasolina 2026* 🛢️`,
       hibrido:   `Línea *Híbrida 2026* 🌿`,
@@ -82,7 +100,9 @@ export const MSG = {
     `¡Excelente elección! ${vehicle.emoji}\n\n${vehicle.ficha}`,
 
   portfolioLink: () =>
-    `🌐 Más fotos y detalles en nuestro catálogo digital:\n*https://gerardo-pineda.vercel.app/*`,
+    ADVISOR_URL
+      ? `🌐 Más fotos y detalles en el catálogo digital de ${ADVISOR_F}:\n*${ADVISOR_URL}*`
+      : `🌐 ${ADVISOR_F} te enviará más detalles en breve.`,
 
   vehicleDetailOptions: () =>
     `¿Qué te parece? 😊\n\n*1️⃣* Quiero cotizar este vehículo 💰\n*2️⃣* Ver otros modelos 🔙`,
@@ -118,10 +138,10 @@ export const MSG = {
     `¿Tienes conocimiento de cómo estás en centrales de riesgo? _(Datacrédito / TransUnion)_\n\n` +
     `*1️⃣* ✅ Sin reportes\n*2️⃣* ⚠️ Con reportes\n*3️⃣* 🤷 No lo sé`,
 
-  // ── Captura de datos del lead ───────────────────────────────────────────────
+  // ── Captura Lead (nombre + teléfono al final) ───────────────────────────────
   askLeadName: () =>
     `¡Ya casi terminamos! 🎉\n\n` +
-    `Para que Gerardo pueda contactarte personalmente,\n` +
+    `Para que ${ADVISOR_F} pueda contactarte personalmente,\n` +
     `¿cuál es tu nombre completo? 😊`,
 
   invalidLeadName: () =>
@@ -135,10 +155,10 @@ export const MSG = {
   invalidLeadPhone: () =>
     `Por favor escribe un número válido, ej: *3001234567* 📱`,
 
-  // ── Cierre de cotización ────────────────────────────────────────────────────
-  creditResponseClean: ()    => `¡Genial, eso facilita mucho el proceso! 🎉`,
+  // ── Cierre ──────────────────────────────────────────────────────────────────
+  creditResponseClean:    () => `¡Genial, eso facilita mucho el proceso! 🎉`,
   creditResponseReported: () => `No hay problema, tenemos opciones para diferentes situaciones 🙌`,
-  creditResponseUnknown: ()  => `Tranquilo, eso lo verificamos fácilmente en el proceso 👍`,
+  creditResponseUnknown:  () => `Tranquilo, eso lo verificamos fácilmente en el proceso 👍`,
 
   qualified: (lead) =>
     `📋 *Resumen de tu asesoría:*\n` +
@@ -155,8 +175,8 @@ export const MSG = {
 
   handoff: (name) =>
     `¡Listo, *${firstName(name)}*! Ya tengo todo lo que necesito 🏆\n\n` +
-    `Estoy preparando tu cotización personalizada con las mejores opciones de financiación.\n\n` +
-    `En breve Gerardo te contacta. ¡Gracias por confiar en *KIA Almotores*! 🤝🚗`,
+    `${ADVISOR_F} está preparando tu cotización personalizada con las mejores opciones de financiación.\n\n` +
+    `En breve te contacta. ¡Gracias por confiar en *KIA Almotores*! 🤝🚗`,
 
   handoffAdvisor: (lead) =>
     `🔔 *NUEVO LEAD — KIA Bot*\n` +
@@ -173,7 +193,7 @@ export const MSG = {
     `_Bot pausado. Cliente listo para contactar._`,
 
   handoffDirect: () =>
-    `¡Claro! En un momento Gerardo estará contigo personalmente 🤝\n\n` +
+    `¡Claro! En un momento ${ADVISOR_F} estará contigo personalmente 🤝\n\n` +
     `Déjame avisarle que quieres hablar con él.`,
 
   handoffAdvisorDirect: (lead) =>
@@ -182,4 +202,22 @@ export const MSG = {
     `👤 *${lead.name || 'Cliente nuevo'}* | 📱 ${formatPhone(lead.phone)}\n` +
     `━━━━━━━━━━━━━━━━\n` +
     `_El cliente solicitó hablar contigo directamente._`,
+
+  // ── Cuando el cliente elige seguir esperando al asesor (opción 3 en armed) ─
+  waitForAdvisor: () =>
+    `¡Perfecto! ${ADVISOR_F} te responderá en cuanto esté disponible 👌\n\n` +
+    `🕐 *Horario de atención:* ${ADVISOR_SCH}\n\n` +
+    `_Si cambias de opinión, escribe *"menu"* y te ayudo con información._`,
+
+  // ── Cliente eligió seguir con asesor en reawaken ────────────────────────────
+  reawakenWaitAdvisor: () =>
+    `Listo, le aviso a ${ADVISOR_F} que volviste a escribirle 👌\n\n` +
+    `Te responderá lo antes posible.`,
+
+  fallback: () =>
+    `Hmm, no entendí bien 😅\n\n` +
+    `Escribe el *número* de la opción que deseas o *"menu"* para ver las opciones.`,
+
+  error: () =>
+    `Tuve un pequeño inconveniente técnico 🙏 Intenta de nuevo en un momento.`,
 };
