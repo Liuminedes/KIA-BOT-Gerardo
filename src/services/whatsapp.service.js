@@ -189,9 +189,14 @@ async function handleIncomingMessage(msg, onMessage, onAdvisorMessage) {
   // Ignorar mensajes sin contenido
   if (!msg.message) return;
 
-  // Ignorar mensajes de grupos
+  // Ignorar mensajes de grupos, newsletters, canales y status broadcast
   const jid = msg.key.remoteJid || '';
-  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return;
+  if (
+    jid.endsWith('@g.us') ||
+    jid.endsWith('@newsletter') ||
+    jid.endsWith('@broadcast') ||
+    jid === 'status@broadcast'
+  ) return;
 
   // Ignorar protocol messages (eliminaciones, ediciones, etc.)
   if (msg.message.protocolMessage) return;
