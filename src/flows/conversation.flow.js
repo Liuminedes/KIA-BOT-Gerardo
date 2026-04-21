@@ -115,12 +115,16 @@ export async function handleMessage({ userId, text, pushName }) {
     }
 
     // ── 4b. REAWAKEN: pasaron >48h sin respuesta, mandar opciones de reconexión
-    if (SessionService.shouldReawaken(session)) {
+    //       EXCEPTO en onlyMode: ahí el bot respeta la pausa para siempre.
+    if (!config.advisor.onlyMode && SessionService.shouldReawaken(session)) {
       logger.info(`[Flow] ⏰ Reawaken para ${userId} tras ${formatHours(Date.now() - session.pausedAt)}h`);
       session.step = STEPS.REAWAKEN_CHOICE;
       // NO cambiar activationMode todavía — si el cliente ignora, seguimos pausados
       await SessionService.save(session);
-      return WhatsAppService.sendText(userId, MSG.reawaken(session.lead?.name || session.pushName));
+      // Usar pushName (nombre del contacto en WhatsApp) en vez de lead.name
+      // porque lead.name puede haber sido capturado en un flujo previo con
+      // otro nombre diferente al del contacto real.
+      return WhatsAppService.sendText(userId, MSG.reawaken(session.pushName || session.lead?.name));
     }
 
     // ── 4c. Todavía dentro de la ventana de pausa: bot silencioso ──────────
@@ -189,7 +193,18 @@ export async function handleAdvisorMessage({ clientUserId }) {
   const existed = await SessionService.exists(clientUserId);
   const session = await SessionService.get(clientUserId);
 
-  // Si el bot ya está en un estado no-activo, no tocar nada
+  // ── Si el bot YA está pausado, refrescar pausedAt para postergar reawaken ─
+  // El asesor sigue activo en la conversación, no queremos que el bot mande
+  // mensaje de reconexión sólo porque pasaron 48h desde la PRIMERA pausa.
+  // Lo que importa es cuándo fue el ÚLTIMO mensaje del asesor.
+  if (SessionService.isPaused(session)) {
+    session.pausedAt = Date.now();
+    await SessionService.save(session);
+    logger.debug(`[Flow] Asesor escribió a ${clientUserId} (ya pausado) — pausedAt refrescado`);
+    return;
+  }
+
+  // Si el bot ya está armado, no tocar nada
   if (session.activationMode !== ACTIVATION_MODE.ACTIVE) {
     logger.debug(`[Flow] Asesor escribió a ${clientUserId} pero modo=${session.activationMode}, ignorando`);
     return;
